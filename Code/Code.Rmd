@@ -1,0 +1,644 @@
+---
+title: "Final_code"
+author: "Corentin Ollivier - Leopold Doville - Romain Meunier"
+date: "2025-03-11"
+output: html_document
+---
+
+```{r}
+log_file = "log_file.txt"
+
+sink(log_file, append = TRUE)
+
+cat("Log file - Execution started at:", Sys.time(), "\n")
+```
+
+# Libraries & function
+
+```{r}
+install.packages(dygraphs)
+install.packages(plm)
+install.packages(lmtest)
+install.packages(gplots)
+install.packages(fixest)
+install.packages(lfe)
+install.packages(sf)
+install.packages(rnaturalearth)
+install.packages(scales)
+install.packages(forecast)
+install.packages(imputeTS)
+```
+
+```{r}
+library(readr)
+library(readxl)
+library(tidyverse)
+library(dplyr)
+library(dygraphs)
+library(stargazer)
+library(ggplot2)
+library(car)
+library(sandwich)
+library(zoo)
+library(plm)
+library(lmtest)
+library(AER)
+library(dplyr)
+library(gplots)
+library(fixest)
+library(lfe)
+library(sf)
+library(rnaturalearth)
+library(scales)
+library(forecast)
+library(imputeTS)
+```
+
+As main of the datasets we are using have the same structure, then we can create a function to modify them the same way more quickly.
+
+```{r}
+data_function = function(df) {
+  colnames(df)[5:68] = seq(from = 1960, to = 2023, by = 1)
+  colnames(df)[3] = "country"
+  df = df[-c(218:222), -c(1:2, 4:4)]
+  df = gather(df, key = time, value = variable_name, 2:65)
+  df = df = spread(df, key = country, value = variable_name)
+  df = df %>% select(where(~ !all(is.na(.))))
+  return(df)
+}
+```
+
+# Data
+
+## Import data
+
+```{r}
+path = "/Users/romins/Documents/TSE/M1/Applied Econometrics/AppliedData/"
+setwd(path)
+```
+
+Let's first import and modify all the dataset needed. 
+
+```{r}
+private_consumption = read_excel("Data/private_consumption.xlsx")
+private_consumption = data_function(private_consumption)
+
+inflation = read_excel("Data/inflation.xlsx")
+inflation = data_function(inflation)
+
+unemployment = read_excel("Data/unemployment.xlsx")
+unemployment = data_function(unemployment)
+
+gdp_per_capita = read_excel("Data/GDP_per_capita.xlsx")
+gdp_per_capita = data_function(gdp_per_capita)
+
+real_interest_rate = read_excel("Data/real_interest_rate.xlsx")
+real_interest_rate = data_function(real_interest_rate)
+
+tax_revenue = read_excel("Data/tax_revenue.xlsx")
+tax_revenue = data_function(tax_revenue)
+```
+
+## Merge the datasets
+
+We then need to get the intersection of all the countries among the datasets
+
+```{r}
+colnames_gdp_per_cap = c(colnames(gdp_per_capita))
+colnames_inflation = c(colnames(inflation))
+colnames_pc = c(colnames(private_consumption))
+colnames_rir = c(colnames(real_interest_rate))
+colnames_unempl = c(colnames(unemployment))
+colnames_taxrev = c(colnames(tax_revenue))
+
+list_countries = list(colnames_inflation, colnames_pc, colnames_rir, colnames_unempl, colnames_taxrev,
+                      colnames_gdp_per_cap)
+
+# get the intersection
+colname = Reduce(intersect, list_countries)
+
+# adjust the datasets
+df_gdp_per_cap_adj = gdp_per_capita %>% select(all_of(colname))
+df_inflation_adj = inflation %>% select(all_of(colname))
+df_pc_adj = private_consumption %>% select(all_of(colname))
+df_rir_adj = real_interest_rate %>% select(all_of(colname))
+df_unempl_adj = unemployment %>% select(all_of(colname))
+df_taxrev_adj = tax_revenue %>% select(all_of(colname))
+```
+
+We need to gather the datasets such that we can merge them.
+
+```{r}
+gdp_per_cap_gather = gather(df_gdp_per_cap_adj, key = country, value = gdp_per_capita, 2:length(colname))
+inflation_gather = gather(df_inflation_adj, key = country, value = inflation, 2:length(colname))
+pc_gather = gather(df_pc_adj, key = country, value = private_consumption, 2:length(colname))
+rir_gather = gather(df_rir_adj, key = country, value = real_interest_rate, 2:length(colname))
+unempl_gather = gather(df_unempl_adj, key = country, value = unemployment, 2:length(colname))
+taxrev_gather = gather(df_taxrev_adj, key = country, value = tax_revenue, 2:length(colname))
+```
+
+We can now merge all the datasets
+
+```{r}
+df = full_join(pc_gather, inflation_gather, by = c("time", "country"))
+df = full_join(df, rir_gather, by = c("time", "country"))
+df = full_join(df, unempl_gather, by = c("time", "country"))
+df = full_join(df, gdp_per_cap_gather, by = c("time", "country"))
+df = full_join(df, taxrev_gather, by = c("time", "country"))
+df$time = as.numeric(as.character(df$time))
+```
+
+## Threshold for NAs
+
+We recreate the function used at the beginning but rather than delete all the columns that have any values, we delete all the columns that have more NA than the threshold define.
+
+```{r}
+data_function_wThreshold = function(df, threshold) {
+  colnames(df)[5:68] = seq(from = 1960, to = 2023, by = 1)
+  colnames(df)[3] = "country"
+  df = df[-c(218:222), -c(1:2, 4:4)]
+  df = gather(df, key = time, value = variable_name, 2:65)
+  df = spread(df, key = country, value = variable_name)
+  df = df %>% select(where(~ sum(!is.na(.)) >= threshold))
+  return(df)
+}
+```
+
+We create a function that will run all the process to get a complete dataset but with the threshold as a parameter. Hence we will be able to compute more quickly all the dataset for all the thresholds.
+
+```{r}
+identify_threshold = function(thr) {
+  threshold = thr
+
+  private_consumption_thr = read_excel("Data/private_consumption.xlsx")
+  private_consumption_thr = data_function_wThreshold(private_consumption_thr, threshold)
+  
+  inflation_thr = read_excel("Data/inflation.xlsx")
+  inflation_thr = data_function_wThreshold(inflation_thr, threshold)
+  
+  unemployment_thr = read_excel("Data/unemployment.xlsx")
+  unemployment_thr = data_function_wThreshold(unemployment_thr, threshold)
+  
+  gdp_per_capita_thr = read_excel("Data/GDP_per_capita.xlsx")
+  gdp_per_capita_thr = data_function_wThreshold(gdp_per_capita_thr, threshold)
+  
+  real_interest_rate_thr = read_excel("Data/real_interest_rate.xlsx")
+  real_interest_rate_thr = data_function_wThreshold(real_interest_rate_thr, threshold)
+  
+  tax_revenue_thr = read_excel("Data/tax_revenue.xlsx")
+  tax_revenue_thr = data_function_wThreshold(tax_revenue_thr, threshold)
+  
+  colnames_gdp_per_cap = c(colnames(gdp_per_capita_thr))
+  colnames_inflation = c(colnames(inflation_thr))
+  colnames_pc = c(colnames(private_consumption_thr))
+  colnames_rir = c(colnames(real_interest_rate_thr))
+  colnames_unempl = c(colnames(unemployment_thr))
+  colnames_taxrev = c(colnames(tax_revenue_thr))
+  
+  list_countries = list(colnames_inflation, colnames_pc, colnames_rir, colnames_unempl, colnames_taxrev,
+                        colnames_gdp_per_cap)
+  
+  colname = Reduce(intersect, list_countries)
+  
+  df_gdp_per_cap_adj = gdp_per_capita_thr %>% select(all_of(colname))
+  df_inflation_adj = inflation_thr %>% select(all_of(colname))
+  df_pc_adj = private_consumption_thr %>% select(all_of(colname))
+  df_rir_adj = real_interest_rate_thr %>% select(all_of(colname))
+  df_unempl_adj = unemployment_thr %>% select(all_of(colname))
+  df_taxrev_adj = tax_revenue_thr %>% select(all_of(colname))
+  
+  gdp_per_cap_gather = gather(df_gdp_per_cap_adj, key = country, value = gdp_per_capita, 2:length(colname))
+  inflation_gather = gather(df_inflation_adj, key = country, value = inflation, 2:length(colname))
+  pc_gather = gather(df_pc_adj, key = country, value = private_consumption, 2:length(colname))
+  rir_gather = gather(df_rir_adj, key = country, value = real_interest_rate, 2:length(colname))
+  unempl_gather = gather(df_unempl_adj, key = country, value = unemployment, 2:length(colname))
+  taxrev_gather = gather(df_taxrev_adj, key = country, value = tax_revenue, 2:length(colname))
+  
+  df = full_join(pc_gather, inflation_gather, by = c("time", "country"))
+  df = full_join(df, rir_gather, by = c("time", "country"))
+  df = full_join(df, unempl_gather, by = c("time", "country"))
+  df = full_join(df, gdp_per_cap_gather, by = c("time", "country"))
+  df = full_join(df, taxrev_gather, by = c("time", "country"))
+  df$time = as.numeric(as.character(df$time))
+
+  return(df)
+}
+```
+
+Let's create all the datasets for the different thresholds.
+
+```{r}
+df_thr5  = identify_threshold(5)
+df_thr10 = identify_threshold(10)
+df_thr15 = identify_threshold(15)
+df_thr20 = identify_threshold(20)
+```
+
+## Fill NA with Kalman filter
+
+In order to predict the NAs we will use a Kalman filter. We need to use the dataset with a threshold of 5 as we need a minimum of 2 values in order to perform the "na_kalman" function. 
+
+```{r}
+pdata_woutNA = pdata.frame(df_thr5, index = c("country", "time"))
+
+pdata_woutNA[, 3:8] = lapply(pdata_woutNA[, 3:8], as.numeric)
+
+# Kalman filtering
+
+pdata_woutNA$private_consumption = with(pdata_woutNA, ave(private_consumption, country, FUN = function(x) {
+                                                       x <- na_kalman(x, model = "StructTS")
+                                                       x[x < 0] <- NA
+                                                       return(x)
+                                                     }))
+
+pdata_woutNA$inflation = with(pdata_woutNA, ave(inflation, country, 
+                                                     FUN = function(x) na_kalman(x, model = "StructTS")))
+
+pdata_woutNA$real_interest_rate = with(pdata_woutNA, ave(real_interest_rate, country, 
+                                                     FUN = function(x) na_kalman(x, model = "StructTS")))
+
+pdata_woutNA$unemployment = with(pdata_woutNA, ave(unemployment, country, 
+                                                     FUN = function(x) na_kalman(x, model = "StructTS")))
+
+pdata_woutNA$gdp_per_capita = with(pdata_woutNA, ave(gdp_per_capita, country, 
+                                                     FUN = function(x) na_kalman(x, model = "StructTS")))
+
+pdata_woutNA$tax_revenue = with(pdata_woutNA, ave(tax_revenue, country, 
+                                                     FUN = function(x) na_kalman(x, model = "StructTS")))
+```
+
+We can plot for a country in order to see if the results seems good or not.
+
+```{r}
+pdata = pdata.frame(df_thr5, index = c("country", "time"))
+pdata_Armenia = pdata %>% filter(country == "Armenia")
+pdata_woutNA_plot = pdata_woutNA %>% filter(country == "Armenia")
+pdata_woutNA_plot$var_woutpred = pdata_Armenia$private_consumption
+
+ggplot(pdata_woutNA_plot, aes(x = time)) +
+  geom_point(aes(y = var_woutpred), color = "green", alpha = 0.5, size = 2) +  # Real values
+  geom_point(aes(y = private_consumption), color = "blue", alpha = 0.5, size = 2) +  # Predicted values
+  labs(title = "Kernel Regression: Real vs. Predicted Values", x = "Private Consumption", 
+       y = "Predicted Private Consumption") +
+  theme_minimal()
+```
+
+## Adjust the dataset
+
+As we find that our estimations for the 20 first years don't look very accurate, then we delete them and use a dataset that is starting in 1980. 
+
+```{r}
+pdata_reduce = as.data.frame(pdata_woutNA)
+pdata_reduce$time = as.numeric(as.character(pdata_reduce$time))
+pdata_reduce = pdata_reduce %>% filter(time >= 1980)
+pdata_reduce = pdata.frame(pdata_reduce, index = c("country", "time"))
+```
+
+```{r}
+write.csv(pdata_reduce, "Dataset_fromR.csv", row.names = FALSE, sep = ";")
+```
+
+# Model
+
+## Descriptive Statistics
+
+```{r}
+pdata_log = pdata_reduce
+pdata_log$private_consumption_log = log(pdata_log$private_consumption)
+pdata_log$gdp_per_capita_log = log(pdata_log$gdp_per_capita)
+
+stargazer(pdata_log[, -c(3:3, 7:7)], type = "text", 
+          summary.stat = c("mean", "sd", "min", "max", "median", "n"))
+```
+
+## Pooling
+
+```{r}
+pooled_model = plm(private_consumption_log ~ real_interest_rate + gdp_per_capita_log + unemployment 
+                   + tax_revenue + lag(gdp_per_capita_log, 1), 
+                   data = pdata_log, index = c("country", "time"), model = "pooling")
+
+stargazer(pooled_model, type = "text", single.row = TRUE, header = FALSE)
+```
+
+## Fixed effects
+
+```{r}
+fixed_model = plm(private_consumption_log ~ real_interest_rate + gdp_per_capita_log + unemployment
+                  + tax_revenue + lag(gdp_per_capita_log, 1), 
+                  data = pdata_log, index = c("country", "time"), model = "within")
+
+stargazer(fixed_model, type = "text", single.row = TRUE, header = FALSE)
+```
+
+## Random effect
+
+```{r}
+random_model = plm(private_consumption_log ~ real_interest_rate + gdp_per_capita_log + unemployment
+                  + tax_revenue + lag(gdp_per_capita_log, 1), 
+                  data = pdata_log, index = c("country", "time"), model = "random")
+
+stargazer(random_model, type = "text", single.row = TRUE, header = FALSE)
+```
+
+## Hausman test
+
+We do a hausman test to decide between random and fixed.
+
+```{r}
+phtest = phtest(fixed_model, random_model)
+phtest
+```
+
+We get a p-value < 0.05 so we should use fixed model.
+
+```{r}
+phtest_table <- data.frame(
+  Test = "Hausman test",
+  Statistic = round(phtest$statistic, 3),
+  p_value = 2.2e-16)
+
+stargazer(phtest_table, summary = FALSE, type = "text",
+          title = "Hausman test Results",
+          rownames = FALSE)
+```
+
+## PFTest
+
+```{r}
+pftest = pFtest(fixed_model, pooled_model)
+pftest
+```
+
+We get a p-value < 0.05 so we should use fixed model.
+
+```{r}
+PFtest_table <- data.frame(
+  Test = "PFTest",
+  Statistic = round(pftest$statistic, 3),
+  p_value = 2.2e-16)
+
+stargazer(PFtest_table, summary = FALSE, type = "text",
+          title = "PFTest Results",
+          rownames = FALSE)
+```
+
+## Breusch-Godfrey Test
+
+```{r}
+pbgtest = pbgtest(fixed_model)
+pbgtest
+```
+
+p-value < 0.05 so we have serial correlation.
+
+```{r}
+PBG_table <- data.frame(
+  Test = "Breusch-Godfrey",
+  Statistic = round(pbgtest$statistic, 3),
+  p_value = 2.2e-16)
+
+stargazer(PBG_table, summary = FALSE, type = "text",
+          title = "Breusch-Godfrey Test Results",
+          rownames = FALSE)
+```
+
+## Breusch-Pagan test
+
+```{r}
+bptest = bptest(fixed_model, data = pdata_log, studentize = FALSE)
+bptest
+```
+
+```{r}
+BP_table <- data.frame(
+  Test = "Breusch-Pagan",
+  Statistic = round(bptest$statistic, 3),
+  p_value = 2.2e-16)
+
+stargazer(BP_table, summary = FALSE, type = "text",
+          title = "Breusch-Pagan Test Results",
+          rownames = FALSE)
+```
+
+p-value < 0.05 so we have heteroskedasticity.
+
+Hence, we need to use robust estimators.
+
+## Robust estimators
+
+```{r}
+robust_estimators = coeftest(fixed_model, vcovHC(random_model, type = "HC0"))
+
+stargazer(robust_estimators, type = "text", single.row = TRUE, header = FALSE)
+```
+
+## GMM
+
+```{r}
+gmm_model = pgmm(private_consumption_log ~ real_interest_rate + gdp_per_capita_log + unemployment 
+                 + tax_revenue + lag(gdp_per_capita_log, 1) 
+                 | inflation + lag(gdp_per_capita_log, 2:99) + lag(private_consumption_log, 1:99), 
+                 data = pdata_log, index = c("country", "time"), model = "twosteps", 
+                 effect = "individual", transformation = "ld", collapse = TRUE)
+
+summary(gmm_model)
+```
+
+```{r}
+stargazer(gmm_model, type = "text", single.row = TRUE, header = FALSE)
+```
+
+## 2SLS
+
+### 2sls with ivreg().
+
+```{r}
+model_2sls = ivreg(private_consumption_log ~ real_interest_rate + gdp_per_capita_log + unemployment 
+                   + tax_revenue + lag(gdp_per_capita_log, 1) 
+                   | inflation + gdp_per_capita_log + unemployment 
+                   + tax_revenue + lag(gdp_per_capita_log, 2) + lag(private_consumption_log, 1), 
+                   data = pdata_log)
+
+summary(model_2sls)
+```
+
+```{r}
+stargazer(model_2sls, type = "text", single.row = TRUE, header = FALSE)
+```
+
+### 2sls with fixed effects.
+
+```{r}
+model_fe2sls = plm(private_consumption_log ~ real_interest_rate + gdp_per_capita_log + unemployment 
+                   + tax_revenue + lag(gdp_per_capita_log, 1) 
+                   | inflation + gdp_per_capita_log + unemployment 
+                   + tax_revenue + lag(gdp_per_capita_log, 2) + lag(private_consumption_log, 1), 
+                   data = pdata_log, model = "within", effect = "individual", inst.method = "bvk")
+
+summary(model_fe2sls)
+```
+
+```{r}
+stargazer(model_fe2sls, type = "text", single.row = TRUE, header = FALSE)
+```
+
+# Plots
+
+## Private consumption
+
+```{r}
+df_clean = na.omit(pdata_log)
+
+plotmeans(private_consumption_log ~ time, data = df_clean, barcol = "black", barwidth = 0.4, n.label = FALSE, 
+          ylab = "Log Private Consumption", xlab = "Time", )
+```
+
+## Real interest rate
+
+```{r}
+plotmeans(real_interest_rate ~ time, data = df_clean, barcol = "black", barwidth = 0.4, n.label = FALSE, 
+          ylab = "Real Interest Rate", xlab = "Time", )
+```
+
+## Fixed effects density
+
+```{r}
+fe_values = fixef(model_fe2sls)  # Extract fixed effects
+fe_df = data.frame(FixedEffects = as.numeric(fe_values))
+```
+
+```{r}
+ggplot(fe_df, aes(x = FixedEffects)) +
+  geom_histogram(aes(y = ..density..), bins = 20, fill = "gray", color = "black", alpha = 0.7) + 
+  geom_density(color = "red", size = 0.6) +
+  labs(x = "Fixed Effects", y = "Density") +
+  theme_minimal()
+
+#title = "Fixed effects distribution with Kernel Density"
+```
+
+## Map
+
+### Real interest rate data
+
+```{r}
+df_map = as.data.frame(pdata_log)
+df_map_rir = df_map %>% group_by(country) %>% summarise(mean_rir = mean(real_interest_rate, na.rm = TRUE))
+df_map_rir = as.data.frame(df_map_rir)
+df_map_rir$country = as.character(df_map_rir$country)
+```
+
+### Private consumption data
+
+```{r}
+df_map_pc = df_map %>% group_by(country) %>% summarise(mean_pc = mean(private_consumption_log, na.rm = TRUE))
+df_map_pc = as.data.frame(df_map_pc)
+df_map_pc$country = as.character(df_map_pc$country)
+```
+
+### Maps
+
+```{r}
+#Import world map data 
+world <- ne_countries(scale = "medium", returnclass = "sf") %>% filter(admin != "Antartica")
+
+# Join 
+data_map_pc <- left_join(world, df_map_pc, by = c("sovereignt" = "country"))
+data_map_rir<- left_join(world, df_map_rir, by = c("sovereignt" = "country"))
+
+#Adapt the name of the country that are not spell in the same in the 2 databases
+
+unmatched <- setdiff(df_map_rir$country, world$name)
+print(unmatched) 
+
+Dataset_Applied_forMap_pc <- df_map_pc %>%
+  mutate(country = case_when(
+    country == "Bahamas, The" ~ "Bahamas",
+    country == "Bosnia and Herzegovina" ~ "Bosnia and Herzegovina",
+    country == "Congo, Dem. Rep." ~ "Democratic Republic of the Congo",
+    country == "Cote d'Ivoire" ~ "Côte d'Ivoire",
+    country == "Dominican Republic" ~ "Dominican Republic",
+    country == "Egypt, Arab Rep." ~ "Egypt",
+    country == "Gambia, The" ~ "Gambia",
+    country == "Iran, Islamic Rep." ~ "Iran",
+    country == "Korea, Rep." ~ "South Korea",
+    country == "Kyrgyz Republic" ~ "Kyrgyzstan",
+    country == "Lao PDR" ~ "Laos",
+    country == "Macao SAR, China" ~ "Macau",
+    country == "Russian Federation" ~ "Russia",
+    country == "Solomon Islands" ~ "Solomon Islands",
+    country == "United States" ~ "United States of America",
+    country == "West Bank and Gaza" ~ "Palestine",
+    TRUE ~ country
+  ))
+
+Dataset_Applied_forMap_rir <- df_map_rir %>%
+  mutate(country = case_when(
+    country == "Bahamas, The" ~ "Bahamas",
+    country == "Bosnia and Herzegovina" ~ "Bosnia and Herzegovina",
+    country == "Congo, Dem. Rep." ~ "Democratic Republic of the Congo",
+    country == "Cote d'Ivoire" ~ "Côte d'Ivoire",
+    country == "Dominican Republic" ~ "Dominican Republic",
+    country == "Egypt, Arab Rep." ~ "Egypt",
+    country == "Gambia, The" ~ "Gambia",
+    country == "Iran, Islamic Rep." ~ "Iran",
+    country == "Korea, Rep." ~ "South Korea",
+    country == "Kyrgyz Republic" ~ "Kyrgyzstan",
+    country == "Lao PDR" ~ "Laos",
+    country == "Macao SAR, China" ~ "Macau",
+    country == "Russian Federation" ~ "Russia",
+    country == "Solomon Islands" ~ "Solomon Islands",
+    country == "United States" ~ "United States of America",
+    country == "West Bank and Gaza" ~ "Palestine",
+    TRUE ~ country
+  ))
+
+# Recompute the merge : 
+data_map_pc  = left_join(world, Dataset_Applied_forMap_pc, by = c("sovereignt" = "country"))
+data_map_rir = left_join(world, Dataset_Applied_forMap_rir, by = c("sovereignt" = "country"))
+```
+
+```{r}
+# Compute the map 
+
+ggplot(data = data_map_pc) +
+  geom_sf(aes(fill = mean_pc), color = "white") +
+  scale_fill_viridis_c(option = "C", na.value = "gray") +# Customize color scale
+  theme_minimal() +
+  labs(
+    #title = "The average private consumption around the world",
+    fill = "Log(C_i)"
+  )
+```
+
+```{r}
+ggplot(data = data_map_rir) +
+  geom_sf(aes(fill = mean_rir), color = "white") +
+  scale_fill_viridis_c(option = "C", na.value = "gray") +# Customize color scale
+  theme_minimal() +
+  labs(
+    #title = "The average real interest rate around the world",
+    fill = "r_i"
+  )
+```
+
+# Final results
+
+```{r}
+stargazer(pooled_model, random_model, fixed_model, type = "text", single.row = TRUE, header = FALSE, 
+          title = "\\centering Econometrics Resutls", 
+          column.labels = c("Pooled", "Random Effects", "Fixed Effects"))
+```
+
+```{r}
+stargazer(model_fe2sls, gmm_model, type = "text", single.row = TRUE, header = FALSE, 
+          title = "\\centering Econometrics Resutls", 
+          column.labels = c("2SLS Fixed Effects", "GMM"))
+```
+
+# Log file
+
+```{r}
+sink()
+```
